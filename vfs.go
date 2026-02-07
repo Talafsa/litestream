@@ -897,6 +897,7 @@ func (f *VFSFile) hasTargetTime() bool {
 }
 
 func (f *VFSFile) Open() error {
+	openStart := time.Now()
 	f.logger.Debug("opening file")
 
 	// Try to get restore plan. For write-enabled VFS, we can create a new database
@@ -910,6 +911,7 @@ func (f *VFSFile) Open() error {
 		}
 		return err
 	}
+	f.logger.Info("[VFS-OPEN] waitForRestorePlan", "elapsed", time.Since(openStart), "files", len(infos))
 
 	pageSize, err := detectPageSizeFromInfos(f.ctx, f.client, infos)
 	if err != nil {
@@ -949,18 +951,21 @@ func (f *VFSFile) Open() error {
 	}
 
 	// Build the page index so we can lookup individual pages.
+	indexStart := time.Now()
 	if err := f.buildIndex(f.ctx, infos); err != nil {
 		f.logger.Error("cannot build index", "error", err)
 		return fmt.Errorf("cannot build index: %w", err)
 	}
+	f.logger.Info("[VFS-OPEN] buildIndex", "elapsed", time.Since(indexStart))
 
-	// Start background hydration if enabled
+	// Start hydration if enabled
 	if f.hydrationPath != "" {
 		if err := f.initHydration(infos); err != nil {
 			f.logger.Warn("hydration initialization failed, continuing without hydration", "error", err)
 			f.hydrationPath = ""
 		}
 	}
+	f.logger.Info("[VFS-OPEN] total Open()", "elapsed", time.Since(openStart), "sync_hydration", f.syncHydration)
 
 	// Continuously monitor the replica client for new LTX files.
 	f.wg.Add(1)
@@ -1168,10 +1173,14 @@ func (f *VFSFile) initHydration(infos []*ltx.FileInfo) error {
 
 	if f.syncHydration {
 		// Synchronous hydration: block until complete so all reads are local.
+		start := time.Now()
+		f.logger.Info("starting synchronous hydration", "files", len(infos), "path", f.hydrationPath)
 		f.runHydration(infos)
 		if err := f.hydrator.Err(); err != nil {
+			f.logger.Error("synchronous hydration failed", "error", err, "elapsed", time.Since(start))
 			return fmt.Errorf("synchronous hydration failed: %w", err)
 		}
+		f.logger.Info("synchronous hydration complete", "elapsed", time.Since(start), "path", f.hydrationPath)
 	} else {
 		// Background hydration: reads from S3 until hydration completes.
 		f.wg.Add(1)
