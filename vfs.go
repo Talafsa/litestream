@@ -79,6 +79,13 @@ type VFS struct {
 	// reads from the local file once complete, eliminating remote fetch latency.
 	HydrationEnabled bool
 
+	// SyncHydration makes hydration synchronous instead of background.
+	// When true (and HydrationEnabled is true), the VFS will block during Open()
+	// until hydration completes, ensuring all reads are served from the local file
+	// immediately. This eliminates remote fetch latency during initialization at
+	// the cost of a slower Open() call.
+	SyncHydration bool
+
 	// HydrationPath is the file path for local hydration file.
 	// If empty and HydrationEnabled is true, a temp file will be used.
 	HydrationPath string
@@ -179,6 +186,7 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 			}
 			f.hydrationPath = filepath.Join(dir, "hydration.db")
 		}
+		f.syncHydration = vfs.SyncHydration
 	}
 
 	if err := f.Open(); err != nil {
@@ -520,6 +528,7 @@ type VFSFile struct {
 
 	hydrator      *Hydrator // Background hydration (nil if disabled)
 	hydrationPath string    // Path for hydration file (set during Open)
+	syncHydration bool      // When true, hydration runs synchronously during Open()
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -1148,24 +1157,36 @@ func (f *VFSFile) buildIndex(ctx context.Context, infos []*ltx.FileInfo) error {
 	return f.rebuildIndex(ctx, infos, nil)
 }
 
-// initHydration starts the background hydration process.
+// initHydration starts the hydration process. When syncHydration is true,
+// hydration runs synchronously (blocking) to ensure all reads are local
+// immediately after Open(). Otherwise, it runs in the background.
 func (f *VFSFile) initHydration(infos []*ltx.FileInfo) error {
 	f.hydrator = NewHydrator(f.hydrationPath, f.pageSize, f.client, f.logger)
 	if err := f.hydrator.Init(); err != nil {
 		return err
 	}
 
-	// Start background restore
-	f.wg.Add(1)
-	go f.runHydration(infos)
+	if f.syncHydration {
+		// Synchronous hydration: block until complete so all reads are local.
+		f.runHydration(infos)
+		if err := f.hydrator.Err(); err != nil {
+			return fmt.Errorf("synchronous hydration failed: %w", err)
+		}
+	} else {
+		// Background hydration: reads from S3 until hydration completes.
+		f.wg.Add(1)
+		go func() {
+			defer f.wg.Done()
+			f.runHydration(infos)
+		}()
+	}
 
 	return nil
 }
 
-// runHydration performs the background hydration process.
+// runHydration performs the hydration process. Can be called synchronously
+// or from a background goroutine.
 func (f *VFSFile) runHydration(infos []*ltx.FileInfo) {
-	defer f.wg.Done()
-
 	if err := f.hydrator.Restore(f.ctx, infos); err != nil {
 		f.hydrator.SetErr(err)
 		f.logger.Error("hydration failed", "error", err)
